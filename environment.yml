@@ -1,0 +1,24 @@
+name: vla
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10.16
+  - pip>=24
+  - git
+  - ffmpeg
+  - pip:
+      # Install this repo in editable mode (pulls core deps from pyproject.toml)
+      - -e .
+
+      # LIBERO rollout/eval extras
+      - imageio[ffmpeg]
+      - robosuite==1.4.1
+      - bddl
+      - easydict
+      - cloudpickle
+      - gym
+
+      # Build helpers (flash-attn post-step)
+      - packaging
+      - ninja
