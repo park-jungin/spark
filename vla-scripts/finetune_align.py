@@ -114,16 +114,17 @@ class FinetuneConfig:
     knowledge_router_hidden_dim: int = 128           # Router MLP hidden width (Dr.LLM-style default)
     knowledge_router_dropout: float = 0.0            # Router dropout
     knowledge_router_temperature: float = 1.0        # Router sigmoid temperature
-    knowledge_router_target_keep_ratio: float = 0.5  # Target ratio of tokens to keep
+    knowledge_router_target_keep_ratio: float = 0.7  # Target ratio of tokens to keep
     knowledge_router_min_keep_tokens: int = 8        # Minimum number of tokens to keep
     knowledge_router_hard_routing: bool = False      # If True, use STE hard routing masks; else soft routing
     knowledge_router_loss_coeff: float = 1.0         # Weight on router focal supervision loss
     knowledge_router_budget_loss_coeff: float = 0.1  # Weight on keep-ratio budget loss
-    knowledge_router_entropy_loss_coeff: float = 0.0 # Weight on entropy regularizer (positive -> avoid collapse)
+    knowledge_router_entropy_loss_coeff: float = 0.1 # Weight on entropy regularizer (positive -> avoid collapse)
     knowledge_router_warmup_steps: int = 500         # Warmup steps before enabling router gating/loss
-    knowledge_router_importance_ema_momentum: float = 0.9  # EMA momentum for gradient-based token-importance pseudo labels
+    knowledge_router_importance_ema_momentum: float = 0.0  # EMA momentum for gradient-based token-importance pseudo labels
     knowledge_router_focal_gamma: float = 2.0        # Focal loss gamma (Dr.LLM-style)
     knowledge_router_effective_num_beta: float = 0.999  # Effective-number reweighting beta (Dr.LLM-style)
+    knowledge_router_token_fusion_mode: str = "no_fusion"  # Deprecated (ignored): kept for CLI/checkpoint compatibility
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
     num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
@@ -1178,6 +1179,7 @@ def forward_dual_path_vla(
     knowledge_router_target_keep_ratio: float = 0.5,
     knowledge_router_min_keep_tokens: int = 8,
     knowledge_router_hard_routing: bool = False,
+    knowledge_router_token_fusion_mode: str = "no_fusion",
     compute_router_loss: bool = True,
 ) -> Tuple[CausalLMOutputWithPast, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
     """
@@ -1289,6 +1291,8 @@ def forward_dual_path_vla(
             expert_tokens: Optional[torch.Tensor],
         ) -> torch.Tensor:
             if visual_path_mode == "dual":
+                if fusion_projector is None:
+                    raise RuntimeError("dual visual mode requires fusion_projector.")
                 return fusion_projector(base_tokens, expert_tokens)
             if visual_path_mode == "base_only":
                 if base_tokens is None:
@@ -1327,69 +1331,78 @@ def forward_dual_path_vla(
         def _fuse_dual_tokens_with_position_drop(
             base_tokens: torch.Tensor,
             expert_tokens: torch.Tensor,
-            selected_indices: torch.Tensor,
-            selected_gate_probs: torch.Tensor,
-        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            gate_probs_dual: torch.Tensor,
+            target_keep_ratio: float,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             batch_size, num_positions, _ = base_tokens.shape
-            zeros_scores = torch.zeros(
-                (batch_size, num_positions), device=selected_indices.device, dtype=selected_gate_probs.dtype
-            )
-            base_scores = zeros_scores.clone()
-            expert_scores = zeros_scores.clone()
-
-            base_selected_mask = selected_indices < num_positions
-            expert_selected_mask = ~base_selected_mask
-
-            if base_selected_mask.any():
-                base_indices = torch.where(base_selected_mask, selected_indices, torch.zeros_like(selected_indices))
-                base_values = torch.where(base_selected_mask, selected_gate_probs, torch.zeros_like(selected_gate_probs))
-                base_scores.scatter_add_(1, base_indices, base_values)
-            if expert_selected_mask.any():
-                expert_indices = torch.where(
-                    expert_selected_mask,
-                    selected_indices - num_positions,
-                    torch.zeros_like(selected_indices),
+            if fusion_projector is None:
+                raise RuntimeError(
+                    "dual visual mode with router expects fusion_projector for concat-and-project token fusion."
                 )
-                expert_values = torch.where(
-                    expert_selected_mask,
-                    selected_gate_probs,
-                    torch.zeros_like(selected_gate_probs),
+            if gate_probs_dual.shape[1] != 2 * num_positions:
+                raise RuntimeError(
+                    "Dual-path per-branch routing expects gate_probs shape (B, 2N). "
+                    f"Got gate_probs={tuple(gate_probs_dual.shape)}, N={num_positions}."
                 )
-                expert_scores.scatter_add_(1, expert_indices, expert_values)
 
-            base_scores = torch.nan_to_num(base_scores, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0)
-            expert_scores = torch.nan_to_num(expert_scores, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0)
+            gate_probs_dual = torch.nan_to_num(gate_probs_dual, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+            base_gate_probs = gate_probs_dual[:, :num_positions]
+            expert_gate_probs = gate_probs_dual[:, num_positions:]
 
-            active_position_mask = (base_scores > 0) | (expert_scores > 0)
-            selected_position_counts = active_position_mask.sum(dim=1)
-            max_selected_positions = int(selected_position_counts.max().item()) if selected_position_counts.numel() > 0 else 0
-            max_selected_positions = max(1, max_selected_positions)
+            # Dual-path selection enforces exact per-path keep ratio over N positions.
+            # (knowledge_router_min_keep_tokens is still used in router losses, but not for this dual-path top-k.)
+            keep_tokens_per_path = int(round(float(target_keep_ratio) * float(num_positions)))
+            keep_tokens_per_path = max(1, min(num_positions, keep_tokens_per_path))
 
-            position_ids = torch.arange(num_positions, device=selected_indices.device, dtype=torch.long).unsqueeze(0).expand(
-                batch_size, -1
+            _, base_topk_idx = torch.topk(
+                base_gate_probs, k=keep_tokens_per_path, dim=1, largest=True, sorted=False
             )
-            pad_id = num_positions
-            padded_position_ids = torch.where(
-                active_position_mask,
-                position_ids,
-                torch.full_like(position_ids, fill_value=pad_id),
+            _, expert_topk_idx = torch.topk(
+                expert_gate_probs, k=keep_tokens_per_path, dim=1, largest=True, sorted=False
             )
-            sorted_positions, _ = torch.sort(padded_position_ids, dim=1)
-            selected_positions = sorted_positions[:, :max_selected_positions]
-            valid_positions_mask = selected_positions < pad_id
-            selected_positions_safe = selected_positions.clamp(max=max(0, num_positions - 1))
+            base_selected_mask_full = torch.zeros_like(base_gate_probs, dtype=torch.bool)
+            expert_selected_mask_full = torch.zeros_like(expert_gate_probs, dtype=torch.bool)
+            base_selected_mask_full.scatter_(1, base_topk_idx, True)
+            expert_selected_mask_full.scatter_(1, expert_topk_idx, True)
+
+            # Keep the union of per-path top-k positions.
+            # Result length is dynamic per sample (in [K, 2K]), then padded to batch max.
+            union_selected_mask_full = base_selected_mask_full | expert_selected_mask_full
+            selected_position_counts = union_selected_mask_full.sum(dim=1, dtype=torch.long)
+            max_selected_positions = int(selected_position_counts.max().item())
+            if max_selected_positions < 1:
+                max_selected_positions = 1
+
+            position_grid = torch.arange(
+                num_positions, device=base_tokens.device, dtype=torch.long
+            ).unsqueeze(0).expand(batch_size, -1)
+            sentinel = torch.full_like(position_grid, fill_value=num_positions)
+            masked_positions = torch.where(union_selected_mask_full, position_grid, sentinel)
+            selected_positions_sorted, _ = torch.sort(masked_positions, dim=1)
+            selected_positions = selected_positions_sorted[:, :max_selected_positions]
+            valid_positions_mask = selected_positions < num_positions
+            selected_positions_safe = torch.where(
+                valid_positions_mask, selected_positions, torch.zeros_like(selected_positions)
+            )
 
             gathered_base = _gather_tokens(base_tokens, selected_positions_safe)
             gathered_expert = _gather_tokens(expert_tokens, selected_positions_safe)
-            gathered_base_scores = torch.gather(base_scores, dim=1, index=selected_positions_safe)
-            gathered_expert_scores = torch.gather(expert_scores, dim=1, index=selected_positions_safe)
-
-            valid_scale = valid_positions_mask.to(dtype=gathered_base.dtype).unsqueeze(-1)
-            gathered_base = gathered_base * gathered_base_scores.unsqueeze(-1) * valid_scale
-            gathered_expert = gathered_expert * gathered_expert_scores.unsqueeze(-1) * valid_scale
-
-            fused_tokens = fusion_projector(gathered_base, gathered_expert)
-            return fused_tokens, valid_positions_mask, selected_position_counts
+            gathered_base_selected_mask = torch.gather(base_selected_mask_full, dim=1, index=selected_positions_safe)
+            gathered_expert_selected_mask = torch.gather(expert_selected_mask_full, dim=1, index=selected_positions_safe)
+            gathered_base_selected_mask = gathered_base_selected_mask & valid_positions_mask
+            gathered_expert_selected_mask = gathered_expert_selected_mask & valid_positions_mask
+            updated_base = gathered_base * gathered_base_selected_mask.to(dtype=gathered_base.dtype).unsqueeze(-1)
+            updated_expert = gathered_expert * gathered_expert_selected_mask.to(dtype=gathered_expert.dtype).unsqueeze(-1)
+            fused_tokens = fusion_projector(updated_base, updated_expert)
+            selected_base_counts = base_selected_mask_full.sum(dim=1, dtype=torch.long)
+            selected_expert_counts = expert_selected_mask_full.sum(dim=1, dtype=torch.long)
+            return (
+                fused_tokens,
+                valid_positions_mask,
+                selected_position_counts,
+                selected_base_counts,
+                selected_expert_counts,
+            )
 
         projected_patch_embeddings = _compose_projected_tokens(base_projected, expert_projected)
         patch_attention_mask = None
@@ -1422,6 +1435,8 @@ def forward_dual_path_vla(
                 candidate_positions = None
 
             if candidate_tokens is not None:
+                router_target_keep_ratio = float(knowledge_router_target_keep_ratio)
+
                 text_mask = (~all_actions_mask) & attention_mask.bool()
                 no_text_tokens = text_mask.sum(dim=1) == 0
                 if no_text_tokens.any():
@@ -1433,36 +1448,48 @@ def forward_dual_path_vla(
                     candidate_tokens=candidate_tokens,
                     text_mask=text_mask,
                     candidate_positions=candidate_positions,
-                    target_keep_ratio=knowledge_router_target_keep_ratio,
+                    target_keep_ratio=router_target_keep_ratio,
                     min_keep_tokens=knowledge_router_min_keep_tokens,
                     hard_routing=knowledge_router_hard_routing,
                     compute_loss=compute_router_loss,
                 )
-                selected_indices = router_aux.get("selected_indices", None)
-                selected_gate_probs = router_aux.get("selected_gate_probs", None)
-                if (
-                    selected_indices is None
-                    or selected_gate_probs is None
-                    or (not torch.isfinite(selected_gate_probs).all())
-                ):
+                router_aux["target_keep_ratio_effective"] = float(router_target_keep_ratio)
+                gate_probs = router_aux.get("gate_probs", None)
+                if gate_probs is None or (not torch.isfinite(gate_probs).all()):
                     router_aux = None
-                else:
-                    selected_indices = selected_indices.long()
-                    selected_gate_probs = selected_gate_probs.to(dtype=candidate_tokens.dtype)
-                    selected_gate_probs = torch.nan_to_num(selected_gate_probs, nan=0.0, posinf=1.0, neginf=0.0)
-                    selected_gate_probs = selected_gate_probs.clamp(min=0.0, max=1.0)
-
-                    if base_projected is not None and expert_projected is not None:
-                        projected_patch_embeddings, patch_attention_mask, selected_position_counts = (
-                            _fuse_dual_tokens_with_position_drop(
-                                base_tokens=base_projected,
-                                expert_tokens=expert_projected,
-                                selected_indices=selected_indices,
-                                selected_gate_probs=selected_gate_probs,
-                            )
+                elif base_projected is not None and expert_projected is not None:
+                    gate_probs = gate_probs.to(dtype=candidate_tokens.dtype)
+                    (
+                        projected_patch_embeddings,
+                        patch_attention_mask,
+                        selected_position_counts,
+                        selected_base_counts,
+                        selected_expert_counts,
+                    ) = (
+                        _fuse_dual_tokens_with_position_drop(
+                            base_tokens=base_projected,
+                            expert_tokens=expert_projected,
+                            gate_probs_dual=gate_probs,
+                            target_keep_ratio=router_target_keep_ratio,
                         )
-                        router_aux["selected_token_count"] = selected_position_counts.to(dtype=selected_gate_probs.dtype).mean()
+                    )
+                    router_aux["selected_token_count"] = selected_position_counts.to(dtype=gate_probs.dtype).mean()
+                    router_aux["selected_base_token_count"] = selected_base_counts.to(dtype=gate_probs.dtype).mean()
+                    router_aux["selected_expert_token_count"] = selected_expert_counts.to(dtype=gate_probs.dtype).mean()
+                else:
+                    selected_indices = router_aux.get("selected_indices", None)
+                    selected_gate_probs = router_aux.get("selected_gate_probs", None)
+                    if (
+                        selected_indices is None
+                        or selected_gate_probs is None
+                        or (not torch.isfinite(selected_gate_probs).all())
+                    ):
+                        router_aux = None
                     else:
+                        selected_indices = selected_indices.long()
+                        selected_gate_probs = selected_gate_probs.to(dtype=candidate_tokens.dtype)
+                        selected_gate_probs = torch.nan_to_num(selected_gate_probs, nan=0.0, posinf=1.0, neginf=0.0)
+                        selected_gate_probs = selected_gate_probs.clamp(min=0.0, max=1.0)
                         if base_projected is not None:
                             base_projected = _gather_tokens(base_projected, selected_indices)
                             base_projected = base_projected * selected_gate_probs.unsqueeze(-1)
@@ -1475,10 +1502,22 @@ def forward_dual_path_vla(
                             dtype=torch.bool,
                             device=projected_patch_embeddings.device,
                         )
-                        router_aux["selected_token_count"] = torch.tensor(
+                        selected_token_count = torch.tensor(
                             float(selected_indices.shape[1]),
                             device=selected_indices.device,
                             dtype=selected_gate_probs.dtype,
+                        )
+                        zero_token_count = torch.tensor(
+                            0.0,
+                            device=selected_indices.device,
+                            dtype=selected_gate_probs.dtype,
+                        )
+                        router_aux["selected_token_count"] = selected_token_count
+                        router_aux["selected_base_token_count"] = (
+                            selected_token_count if base_projected is not None else zero_token_count
+                        )
+                        router_aux["selected_expert_token_count"] = (
+                            selected_token_count if expert_projected is not None else zero_token_count
                         )
 
         projected_patch_embeddings = vla_core._process_proprio_features(
@@ -1650,6 +1689,7 @@ def run_forward_pass(
     knowledge_router_target_keep_ratio: float = 0.5,
     knowledge_router_min_keep_tokens: int = 8,
     knowledge_router_hard_routing: bool = False,
+    knowledge_router_token_fusion_mode: str = "no_fusion",
     knowledge_router_warmup_steps: int = 500,
     knowledge_router_importance_ema_momentum: float = 0.9,
     current_step: int = 0,
@@ -1702,7 +1742,17 @@ def run_forward_pass(
     router_keep_ratio = ground_truth_actions.new_zeros(())
     router_action_sup_loss = ground_truth_actions.new_zeros(())
     router_selected_tokens = ground_truth_actions.new_zeros(())
+    router_selected_tokens_base = ground_truth_actions.new_zeros(())
+    router_selected_tokens_expert = ground_truth_actions.new_zeros(())
     router_total_loss = ground_truth_actions.new_zeros(())
+    router_gate_std = ground_truth_actions.new_zeros(())
+    router_gate_row_std = ground_truth_actions.new_zeros(())
+    router_gate_min = ground_truth_actions.new_zeros(())
+    router_gate_max = ground_truth_actions.new_zeros(())
+    router_gate_q10 = ground_truth_actions.new_zeros(())
+    router_gate_q50 = ground_truth_actions.new_zeros(())
+    router_gate_q90 = ground_truth_actions.new_zeros(())
+    router_gate_entropy = ground_truth_actions.new_zeros(())
     router_aux: Optional[Dict[str, torch.Tensor]] = None
     router_enabled_now = (
         use_knowledge_router
@@ -1744,9 +1794,12 @@ def run_forward_pass(
             knowledge_router_target_keep_ratio=knowledge_router_target_keep_ratio,
             knowledge_router_min_keep_tokens=knowledge_router_min_keep_tokens,
             knowledge_router_hard_routing=knowledge_router_hard_routing,
+            knowledge_router_token_fusion_mode=knowledge_router_token_fusion_mode,
             compute_router_loss=False,
         )
         effective_num_patches = projected_patch_embeddings.shape[1]
+
+    llm_visual_tokens = ground_truth_actions.new_tensor(float(effective_num_patches))
 
     # Get action masks needed for logging
     ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)
@@ -1878,6 +1931,7 @@ def run_forward_pass(
                         knowledge_router_target_keep_ratio=knowledge_router_target_keep_ratio,
                         knowledge_router_min_keep_tokens=knowledge_router_min_keep_tokens,
                         knowledge_router_hard_routing=knowledge_router_hard_routing,
+                        knowledge_router_token_fusion_mode=knowledge_router_token_fusion_mode,
                         knowledge_router_warmup_steps=knowledge_router_warmup_steps,
                         current_step=current_step,
                     )
@@ -1908,7 +1962,36 @@ def run_forward_pass(
     if router_aux is not None and router_enabled_now:
         gate_probs = router_aux.get("gate_probs", None)
         if gate_probs is not None and torch.isfinite(gate_probs).all():
-            router_keep_ratio = torch.nan_to_num(gate_probs.mean(), nan=0.0, posinf=0.0, neginf=0.0)
+            gate_probs_stats = torch.nan_to_num(gate_probs.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+            router_keep_ratio = torch.nan_to_num(gate_probs_stats.mean(), nan=0.0, posinf=0.0, neginf=0.0)
+            router_gate_std = torch.nan_to_num(gate_probs_stats.std(unbiased=False), nan=0.0, posinf=0.0, neginf=0.0)
+            router_gate_min = torch.nan_to_num(gate_probs_stats.min(), nan=0.0, posinf=0.0, neginf=0.0)
+            router_gate_max = torch.nan_to_num(gate_probs_stats.max(), nan=0.0, posinf=0.0, neginf=0.0)
+            if gate_probs_stats.shape[1] > 1:
+                router_gate_row_std = torch.nan_to_num(
+                    gate_probs_stats.std(dim=1, unbiased=False).mean(),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+            else:
+                router_gate_row_std = gate_probs_stats.new_zeros(())
+
+            if gate_probs_stats.numel() > 0:
+                flat_probs = gate_probs_stats.reshape(-1)
+                gate_q = torch.quantile(
+                    flat_probs,
+                    torch.tensor([0.1, 0.5, 0.9], device=flat_probs.device, dtype=flat_probs.dtype),
+                )
+                router_gate_q10, router_gate_q50, router_gate_q90 = gate_q[0], gate_q[1], gate_q[2]
+
+            safe_stats_probs = gate_probs_stats.clamp(min=1e-6, max=1.0 - 1e-6)
+            router_gate_entropy = torch.nan_to_num(
+                -(safe_stats_probs * torch.log(safe_stats_probs) + (1.0 - safe_stats_probs) * torch.log(1.0 - safe_stats_probs)).mean(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
             selected_token_count = router_aux.get("selected_token_count", None)
             if selected_token_count is not None:
                 router_selected_tokens = torch.nan_to_num(
@@ -1919,6 +2002,22 @@ def run_forward_pass(
                 )
             else:
                 router_selected_tokens = gate_probs.new_tensor(float(gate_probs.shape[1]))
+            selected_base_token_count = router_aux.get("selected_base_token_count", None)
+            if selected_base_token_count is not None:
+                router_selected_tokens_base = torch.nan_to_num(
+                    selected_base_token_count,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+            selected_expert_token_count = router_aux.get("selected_expert_token_count", None)
+            if selected_expert_token_count is not None:
+                router_selected_tokens_expert = torch.nan_to_num(
+                    selected_expert_token_count,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
             if loss.requires_grad:
                 action_gate_grads = torch.autograd.grad(
                     outputs=loss,
@@ -1965,16 +2064,19 @@ def run_forward_pass(
                     action_token_importance = action_token_importance.clone()
                     action_token_importance[invalid_rows_after_ema] = fallback_scores[invalid_rows_after_ema]
 
+                target_keep_ratio_for_loss = float(
+                    router_aux.get("target_keep_ratio_effective", knowledge_router_target_keep_ratio)
+                )
                 action_pseudo_targets = router_module._build_online_pseudo_targets(
                     token_scores=action_token_importance,
-                    target_keep_ratio=knowledge_router_target_keep_ratio,
+                    target_keep_ratio=target_keep_ratio_for_loss,
                     min_keep_tokens=knowledge_router_min_keep_tokens,
                 )
 
                 router_action_sup_loss = router_module._focal_binary_loss(gate_probs, action_pseudo_targets)
                 router_cls_loss = torch.nan_to_num(router_action_sup_loss, nan=0.0, posinf=0.0, neginf=0.0)
 
-                router_budget_loss = torch.abs(gate_probs.mean(dim=1) - float(knowledge_router_target_keep_ratio)).mean()
+                router_budget_loss = torch.abs(gate_probs.mean(dim=1) - target_keep_ratio_for_loss).mean()
                 safe_probs = gate_probs.clamp(min=1e-6, max=1.0 - 1e-6)
                 entropy = -(safe_probs * torch.log(safe_probs) + (1.0 - safe_probs) * torch.log(1.0 - safe_probs))
                 router_entropy_loss = -entropy.mean()
@@ -1994,8 +2096,20 @@ def run_forward_pass(
             "router_cls_loss": router_cls_loss.item(),
             "router_action_sup_loss": router_action_sup_loss.item(),
             "router_budget_loss": router_budget_loss.item(),
+            "router_entropy_loss": router_entropy_loss.item(),
             "router_keep_ratio": router_keep_ratio.item(),
             "router_selected_tokens": router_selected_tokens.item(),
+            "router_selected_tokens_base": router_selected_tokens_base.item(),
+            "router_selected_tokens_expert": router_selected_tokens_expert.item(),
+            "llm_visual_tokens": llm_visual_tokens.item(),
+            "router_gate_std": router_gate_std.item(),
+            "router_gate_row_std": router_gate_row_std.item(),
+            "router_gate_min": router_gate_min.item(),
+            "router_gate_max": router_gate_max.item(),
+            "router_gate_q10": router_gate_q10.item(),
+            "router_gate_q50": router_gate_q50.item(),
+            "router_gate_q90": router_gate_q90.item(),
+            "router_gate_entropy": router_gate_entropy.item(),
         }
     )
 
@@ -2029,6 +2143,7 @@ def run_diffusion_sampling(
     knowledge_router_target_keep_ratio: float = 0.5,
     knowledge_router_min_keep_tokens: int = 8,
     knowledge_router_hard_routing: bool = False,
+    knowledge_router_token_fusion_mode: str = "no_fusion",
     knowledge_router_warmup_steps: int = 500,
     current_step: int = 0,
 ) -> torch.Tensor:
@@ -2103,6 +2218,7 @@ def run_diffusion_sampling(
                 knowledge_router_target_keep_ratio=knowledge_router_target_keep_ratio,
                 knowledge_router_min_keep_tokens=knowledge_router_min_keep_tokens,
                 knowledge_router_hard_routing=knowledge_router_hard_routing,
+                knowledge_router_token_fusion_mode=knowledge_router_token_fusion_mode,
                 compute_router_loss=False,
             )
             # Get last layer hidden states
@@ -2405,6 +2521,7 @@ def run_validation(
                 knowledge_router_target_keep_ratio=cfg.knowledge_router_target_keep_ratio,
                 knowledge_router_min_keep_tokens=cfg.knowledge_router_min_keep_tokens,
                 knowledge_router_hard_routing=cfg.knowledge_router_hard_routing,
+                knowledge_router_token_fusion_mode=cfg.knowledge_router_token_fusion_mode,
                 knowledge_router_warmup_steps=cfg.knowledge_router_warmup_steps,
                 knowledge_router_importance_ema_momentum=cfg.knowledge_router_importance_ema_momentum,
                 current_step=log_step,
@@ -2444,6 +2561,18 @@ def run_validation(
                 f"[Validation @ Step {log_step}] "
                 f"loss={format_metric(avg_val_metrics, 'loss_value')} "
                 f"align={format_metric(avg_val_metrics, 'attn_align_loss')} "
+                f"router={format_metric(avg_val_metrics, 'router_loss')} "
+                f"keep={format_metric(avg_val_metrics, 'router_keep_ratio')} "
+                f"kept_tokens={format_metric(avg_val_metrics, 'router_selected_tokens')} "
+                f"kept_base={format_metric(avg_val_metrics, 'router_selected_tokens_base')} "
+                f"kept_expert={format_metric(avg_val_metrics, 'router_selected_tokens_expert')} "
+                f"llm_vis={format_metric(avg_val_metrics, 'llm_visual_tokens')} "
+                f"gstd={format_metric(avg_val_metrics, 'router_gate_std')} "
+                f"growstd={format_metric(avg_val_metrics, 'router_gate_row_std')} "
+                f"gq10={format_metric(avg_val_metrics, 'router_gate_q10')} "
+                f"gq50={format_metric(avg_val_metrics, 'router_gate_q50')} "
+                f"gq90={format_metric(avg_val_metrics, 'router_gate_q90')} "
+                f"gent={format_metric(avg_val_metrics, 'router_gate_entropy')} "
                 f"curr_l1={format_metric(avg_val_metrics, 'curr_action_l1_loss')} "
                 f"next_l1={format_metric(avg_val_metrics, 'next_actions_l1_loss')} "
                 f"batches={val_batches_count} "
@@ -2766,6 +2895,8 @@ def run_rollout_validation(
                 str(cfg.knowledge_router_focal_gamma),
                 "--knowledge_router_effective_num_beta",
                 str(cfg.knowledge_router_effective_num_beta),
+                "--knowledge_router_token_fusion_mode",
+                str(cfg.knowledge_router_token_fusion_mode),
                 "--visual_path_mode",
                 str(cfg.visual_path_mode),
                 "--num_images_in_input",
@@ -2972,7 +3103,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                 "[Knowledge Router] Enabled: "
                 f"keep_ratio={cfg.knowledge_router_target_keep_ratio}, "
                 f"warmup={cfg.knowledge_router_warmup_steps}, "
-                f"hard={cfg.knowledge_router_hard_routing}"
+                f"hard={cfg.knowledge_router_hard_routing}, "
+                "fusion=concat_projector"
             )
 
     # Initialize wandb logging
@@ -3208,7 +3340,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 device_id,
                 single_path_projector_args,
             )
-        else:
+        if cfg.visual_path_mode in {"dual", "base_only", "expert_only"}:
             fusion_projector_args = {"llm_dim": vla.module.llm_dim}
             if cfg.use_siglip_only_vision or cfg.use_dino_only_vision:
                 fusion_projector_args["input_dim"] = vla_alignment_featurizer.embed_dim
@@ -3472,8 +3604,20 @@ def finetune(cfg: FinetuneConfig) -> None:
         "router_cls_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "router_action_sup_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "router_budget_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "router_entropy_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "router_keep_ratio": deque(maxlen=cfg.grad_accumulation_steps),
         "router_selected_tokens": deque(maxlen=cfg.grad_accumulation_steps),
+        "router_selected_tokens_base": deque(maxlen=cfg.grad_accumulation_steps),
+        "router_selected_tokens_expert": deque(maxlen=cfg.grad_accumulation_steps),
+        "llm_visual_tokens": deque(maxlen=cfg.grad_accumulation_steps),
+        "router_gate_std": deque(maxlen=cfg.grad_accumulation_steps),
+        "router_gate_row_std": deque(maxlen=cfg.grad_accumulation_steps),
+        "router_gate_min": deque(maxlen=cfg.grad_accumulation_steps),
+        "router_gate_max": deque(maxlen=cfg.grad_accumulation_steps),
+        "router_gate_q10": deque(maxlen=cfg.grad_accumulation_steps),
+        "router_gate_q50": deque(maxlen=cfg.grad_accumulation_steps),
+        "router_gate_q90": deque(maxlen=cfg.grad_accumulation_steps),
+        "router_gate_entropy": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
     # Start training (offset tqdm when resuming so visual progress matches `log_step`).
@@ -3530,6 +3674,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 knowledge_router_target_keep_ratio=cfg.knowledge_router_target_keep_ratio,
                 knowledge_router_min_keep_tokens=cfg.knowledge_router_min_keep_tokens,
                 knowledge_router_hard_routing=cfg.knowledge_router_hard_routing,
+                knowledge_router_token_fusion_mode=cfg.knowledge_router_token_fusion_mode,
                 knowledge_router_warmup_steps=cfg.knowledge_router_warmup_steps,
                 knowledge_router_importance_ema_momentum=cfg.knowledge_router_importance_ema_momentum,
                 current_step=(
@@ -3608,8 +3753,20 @@ def finetune(cfg: FinetuneConfig) -> None:
                         f"loss={format_metric(smoothened_metrics, 'loss_value')} "
                         f"align={format_metric(smoothened_metrics, 'attn_align_loss')} "
                         f"router={format_metric(smoothened_metrics, 'router_loss')} "
+                        f"r_cls={format_metric(smoothened_metrics, 'router_cls_loss')} "
+                        f"r_budget={format_metric(smoothened_metrics, 'router_budget_loss')} "
+                        f"r_ent={format_metric(smoothened_metrics, 'router_entropy_loss')} "
                         f"keep={format_metric(smoothened_metrics, 'router_keep_ratio')} "
                         f"kept_tokens={format_metric(smoothened_metrics, 'router_selected_tokens')} "
+                        f"kept_base={format_metric(smoothened_metrics, 'router_selected_tokens_base')} "
+                        f"kept_expert={format_metric(smoothened_metrics, 'router_selected_tokens_expert')} "
+                        f"llm_vis={format_metric(smoothened_metrics, 'llm_visual_tokens')} "
+                        f"gstd={format_metric(smoothened_metrics, 'router_gate_std')} "
+                        f"growstd={format_metric(smoothened_metrics, 'router_gate_row_std')} "
+                        f"gq10={format_metric(smoothened_metrics, 'router_gate_q10')} "
+                        f"gq50={format_metric(smoothened_metrics, 'router_gate_q50')} "
+                        f"gq90={format_metric(smoothened_metrics, 'router_gate_q90')} "
+                        f"gent={format_metric(smoothened_metrics, 'router_gate_entropy')} "
                         f"curr_l1={format_metric(smoothened_metrics, 'curr_action_l1_loss')} "
                         f"next_l1={format_metric(smoothened_metrics, 'next_actions_l1_loss')} "
                         f"lr={scheduler.get_last_lr()[0]:.3e}"

@@ -205,11 +205,12 @@ class GenerateConfig:
     knowledge_router_hidden_dim: int = 128           # Router MLP hidden width
     knowledge_router_dropout: float = 0.0            # Router dropout
     knowledge_router_temperature: float = 1.0        # Router sigmoid temperature
-    knowledge_router_target_keep_ratio: float = 0.5  # Router target keep ratio
-    knowledge_router_min_keep_tokens: int = 8        # Router min tokens to keep
+    knowledge_router_target_keep_ratio: float = 0.7  # Router target keep ratio
+    knowledge_router_min_keep_tokens: int = 250        # Router min tokens to keep
     knowledge_router_hard_routing: bool = False      # Hard/STE gating in router
     knowledge_router_focal_gamma: float = 2.0        # Focal gamma (for checkpoint compatibility)
     knowledge_router_effective_num_beta: float = 0.999  # Effective-number beta (for checkpoint compatibility)
+    knowledge_router_token_fusion_mode: str = "no_fusion"  # Deprecated (ignored): kept for CLI/checkpoint compatibility
     visual_path_mode: str = "dual"                   # Visual mode: dual | base_only | expert_only | base_only_separate | expert_only_separate
     num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = True                         # Whether to include proprio state in input
@@ -302,7 +303,6 @@ def validate_config(cfg: GenerateConfig) -> None:
             "forcing `use_knowledge_router=False`."
         )
         cfg.use_knowledge_router = False
-
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
     assert 0.0 <= cfg.router_overlay_alpha <= 1.0, "router_overlay_alpha must be in [0, 1]."
@@ -333,7 +333,7 @@ def initialize_model(cfg: GenerateConfig):
     if cfg.use_siglip_only_vision or cfg.use_dino_only_vision:
         if cfg.visual_path_mode in {"base_only_separate", "expert_only_separate"}:
             single_path_projector = get_single_path_projector(cfg, model.llm_dim)
-        else:
+        if cfg.visual_path_mode in {"dual", "base_only", "expert_only"}:
             fusion_projector = get_fusion_projector(cfg, model.llm_dim)
         if cfg.use_knowledge_router:
             knowledge_router = get_knowledge_router(cfg, model.llm_dim)

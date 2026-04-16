@@ -826,6 +826,7 @@ def apply_knowledge_routing(
         return base_patch_features, expert_patch_features
 
     candidate_positions = None
+    router_target_keep_ratio = float(getattr(cfg, "knowledge_router_target_keep_ratio", 0.5))
     if base_patch_features is not None and expert_patch_features is not None:
         if base_patch_features.shape != expert_patch_features.shape:
             raise RuntimeError(
@@ -861,121 +862,118 @@ def apply_knowledge_routing(
         candidate_tokens=candidate_tokens,
         text_mask=text_mask,
         candidate_positions=candidate_positions,
-        target_keep_ratio=float(getattr(cfg, "knowledge_router_target_keep_ratio", 0.5)),
+        target_keep_ratio=router_target_keep_ratio,
         min_keep_tokens=int(getattr(cfg, "knowledge_router_min_keep_tokens", 8)),
         hard_routing=bool(getattr(cfg, "knowledge_router_hard_routing", False)),
         compute_loss=False,
     )
-    selected_indices = router_aux.get("selected_indices", None)
-    selected_gate_probs = router_aux.get("selected_gate_probs", None)
-    if selected_indices is None or selected_gate_probs is None:
+    gate_probs = router_aux.get("gate_probs", None)
+    if gate_probs is None or (not torch.isfinite(gate_probs).all()):
         set_last_router_viz(None)
         return base_patch_features, expert_patch_features
-
-    selected_indices = selected_indices.long()
-    selected_gate_probs = selected_gate_probs.to(candidate_tokens.dtype)
-    selected_gate_probs = torch.nan_to_num(selected_gate_probs, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0)
+    gate_probs = gate_probs.to(candidate_tokens.dtype)
+    gate_probs = torch.nan_to_num(gate_probs, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0)
 
     # Inference-time routing diagnostics: report selected token count and gate confidence.
-    selected_tokens = int(selected_indices.shape[1])
     total_tokens = int(candidate_tokens.shape[1])
-    keep_ratio = (float(selected_tokens) / float(total_tokens)) if total_tokens > 0 else 0.0
-    effective_gate = float(selected_gate_probs.mean().item()) if selected_gate_probs.numel() > 0 else 0.0
+    effective_gate = float(gate_probs.mean().item()) if gate_probs.numel() > 0 else 0.0
     if base_patch_features is not None and expert_patch_features is not None:
         batch_size, num_positions, _ = base_patch_features.shape
-        zeros_scores = torch.zeros((batch_size, num_positions), device=selected_indices.device, dtype=selected_gate_probs.dtype)
-        base_scores = zeros_scores.clone()
-        expert_scores = zeros_scores.clone()
-        base_selected_binary = zeros_scores.clone()
-        expert_selected_binary = zeros_scores.clone()
+        if gate_probs.shape[1] != 2 * num_positions:
+            raise RuntimeError(
+                "Dual-path per-branch routing expects gate_probs shape (B, 2N). "
+                f"Got gate_probs={tuple(gate_probs.shape)}, N={num_positions}."
+            )
+        # Dual-path selection enforces exact per-path keep ratio over N positions.
+        # (knowledge_router_min_keep_tokens is still used in router losses, but not for this dual-path top-k.)
+        keep_tokens_per_path = int(round(float(router_target_keep_ratio) * float(num_positions)))
+        keep_tokens_per_path = max(1, min(num_positions, keep_tokens_per_path))
 
-        base_selected_mask = selected_indices < num_positions
-        expert_selected_mask = ~base_selected_mask
+        base_gate_probs = gate_probs[:, :num_positions]
+        expert_gate_probs = gate_probs[:, num_positions:]
+        _, base_topk_idx = torch.topk(
+            base_gate_probs,
+            k=keep_tokens_per_path,
+            dim=1,
+            largest=True,
+            sorted=False,
+        )
+        _, expert_topk_idx = torch.topk(
+            expert_gate_probs,
+            k=keep_tokens_per_path,
+            dim=1,
+            largest=True,
+            sorted=False,
+        )
 
-        if base_selected_mask.any():
-            base_indices = torch.where(base_selected_mask, selected_indices, torch.zeros_like(selected_indices))
-            base_values = torch.where(base_selected_mask, selected_gate_probs, torch.zeros_like(selected_gate_probs))
-            base_scores.scatter_add_(1, base_indices, base_values)
-            base_binary_values = torch.where(
-                base_selected_mask,
-                torch.ones_like(selected_gate_probs),
-                torch.zeros_like(selected_gate_probs),
-            )
-            base_selected_binary.scatter_add_(1, base_indices, base_binary_values)
-        if expert_selected_mask.any():
-            expert_indices = torch.where(
-                expert_selected_mask,
-                selected_indices - num_positions,
-                torch.zeros_like(selected_indices),
-            )
-            expert_values = torch.where(
-                expert_selected_mask,
-                selected_gate_probs,
-                torch.zeros_like(selected_gate_probs),
-            )
-            expert_scores.scatter_add_(1, expert_indices, expert_values)
-            expert_binary_values = torch.where(
-                expert_selected_mask,
-                torch.ones_like(selected_gate_probs),
-                torch.zeros_like(selected_gate_probs),
-            )
-            expert_selected_binary.scatter_add_(1, expert_indices, expert_binary_values)
+        base_selected_binary = torch.zeros_like(base_gate_probs, dtype=torch.bool)
+        expert_selected_binary = torch.zeros_like(expert_gate_probs, dtype=torch.bool)
+        base_selected_binary.scatter_(1, base_topk_idx, True)
+        expert_selected_binary.scatter_(1, expert_topk_idx, True)
+        union_selected_binary = base_selected_binary | expert_selected_binary
 
-        base_scores = torch.nan_to_num(base_scores, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0)
-        expert_scores = torch.nan_to_num(expert_scores, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0)
-        base_selected_binary = torch.nan_to_num(base_selected_binary, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0)
-        expert_selected_binary = torch.nan_to_num(expert_selected_binary, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0)
+        selected_position_counts = union_selected_binary.sum(dim=1, dtype=torch.long)
+        max_selected_positions = int(selected_position_counts.max().item())
+        if max_selected_positions < 1:
+            max_selected_positions = 1
+
+        position_grid = torch.arange(num_positions, device=gate_probs.device, dtype=torch.long).unsqueeze(0)
+        position_grid = position_grid.expand(batch_size, -1)
+        sentinel = torch.full_like(position_grid, fill_value=num_positions)
+        masked_positions = torch.where(union_selected_binary, position_grid, sentinel)
+        selected_positions_sorted, _ = torch.sort(masked_positions, dim=1)
+        selected_positions = selected_positions_sorted[:, :max_selected_positions]
+        valid_positions_mask = selected_positions < num_positions
+        selected_positions_safe = torch.where(valid_positions_mask, selected_positions, torch.zeros_like(selected_positions))
+        selected_pos_expanded = selected_positions_safe.unsqueeze(-1).expand(-1, -1, base_patch_features.shape[-1])
+        updated_base = torch.gather(base_patch_features, dim=1, index=selected_pos_expanded)
+        updated_expert = torch.gather(expert_patch_features, dim=1, index=selected_pos_expanded)
+
+        selected_base_binary = torch.gather(base_selected_binary, dim=1, index=selected_positions_safe) & valid_positions_mask
+        selected_expert_binary = torch.gather(expert_selected_binary, dim=1, index=selected_positions_safe) & valid_positions_mask
+        updated_base = updated_base * selected_base_binary.to(dtype=updated_base.dtype).unsqueeze(-1)
+        updated_expert = updated_expert * selected_expert_binary.to(dtype=updated_expert.dtype).unsqueeze(-1)
+
+        selected_tokens = int(selected_position_counts.float().mean().item())
+        selected_base_tokens = int(base_selected_binary.sum(dim=1, dtype=torch.long).float().mean().item())
+        selected_expert_tokens = int(expert_selected_binary.sum(dim=1, dtype=torch.long).float().mean().item())
+        keep_ratio = (float(selected_tokens) / float(num_positions)) if num_positions > 0 else 0.0
 
         # Cache router scores for optional rollout visualization (batch index 0).
         set_last_router_viz(
             {
-                "base_scores": base_scores[0].detach().float().cpu().numpy(),
-                "expert_scores": expert_scores[0].detach().float().cpu().numpy(),
+                "base_scores": base_gate_probs[0].detach().float().cpu().numpy(),
+                "expert_scores": expert_gate_probs[0].detach().float().cpu().numpy(),
                 "base_selected_binary": base_selected_binary[0].detach().float().cpu().numpy(),
                 "expert_selected_binary": expert_selected_binary[0].detach().float().cpu().numpy(),
                 "num_positions": int(num_positions),
                 "num_images_in_input": int(getattr(cfg, "num_images_in_input", 1)),
                 "selected_tokens": int(selected_tokens),
+                "selected_base_tokens": int(selected_base_tokens),
+                "selected_expert_tokens": int(selected_expert_tokens),
                 "total_tokens": int(total_tokens),
                 "keep_ratio": float(keep_ratio),
                 "gate_mean": float(effective_gate),
             }
         )
-
-        active_position_mask = (base_scores > 0) | (expert_scores > 0)
-        selected_position_count = int(active_position_mask.sum(dim=1).max().item()) if active_position_mask.numel() > 0 else 0
-        selected_position_count = max(1, selected_position_count)
-
-        position_ids = torch.arange(num_positions, device=selected_indices.device, dtype=torch.long).unsqueeze(0).expand(
-            batch_size, -1
-        )
-        pad_id = num_positions
-        padded_position_ids = torch.where(
-            active_position_mask,
-            position_ids,
-            torch.full_like(position_ids, fill_value=pad_id),
-        )
-        sorted_positions, _ = torch.sort(padded_position_ids, dim=1)
-        selected_positions = sorted_positions[:, :selected_position_count]
-        valid_positions_mask = selected_positions < pad_id
-        selected_positions_safe = selected_positions.clamp(max=max(0, num_positions - 1))
-
-        selected_pos_expanded = selected_positions_safe.unsqueeze(-1).expand(-1, -1, base_patch_features.shape[-1])
-        updated_base = torch.gather(base_patch_features, dim=1, index=selected_pos_expanded)
-        updated_expert = torch.gather(expert_patch_features, dim=1, index=selected_pos_expanded)
-        selected_base_scores = torch.gather(base_scores, dim=1, index=selected_positions_safe)
-        selected_expert_scores = torch.gather(expert_scores, dim=1, index=selected_positions_safe)
-        valid_scale = valid_positions_mask.to(dtype=updated_base.dtype).unsqueeze(-1)
-        updated_base = updated_base * selected_base_scores.unsqueeze(-1) * valid_scale
-        updated_expert = updated_expert * selected_expert_scores.unsqueeze(-1) * valid_scale
-
-        position_keep_ratio = float(active_position_mask.float().mean().item()) if active_position_mask.numel() > 0 else 0.0
         print(
-            f"[Router][Inference] selected_tokens={selected_tokens}/{total_tokens} "
-            f"keep_ratio={keep_ratio:.4f} kept_positions={selected_position_count}/{num_positions} "
-            f"pos_keep_ratio={position_keep_ratio:.4f} gate_mean={effective_gate:.4f}"
+            f"[Router][Inference] selected_base={selected_base_tokens}/{num_positions} "
+            f"selected_expert={selected_expert_tokens}/{num_positions} "
+            f"fused_tokens={selected_tokens}/{num_positions} "
+            f"keep_ratio={keep_ratio:.4f} gate_mean={effective_gate:.4f}"
         )
         return updated_base, updated_expert
+
+    selected_indices = router_aux.get("selected_indices", None)
+    selected_gate_probs = router_aux.get("selected_gate_probs", None)
+    if selected_indices is None or selected_gate_probs is None:
+        set_last_router_viz(None)
+        return base_patch_features, expert_patch_features
+    selected_indices = selected_indices.long()
+    selected_gate_probs = selected_gate_probs.to(candidate_tokens.dtype)
+    selected_gate_probs = torch.nan_to_num(selected_gate_probs, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0)
+    selected_tokens = int(selected_indices.shape[1])
+    keep_ratio = (float(selected_tokens) / float(total_tokens)) if total_tokens > 0 else 0.0
 
     print(
         f"[Router][Inference] selected_tokens={selected_tokens}/{total_tokens} "
