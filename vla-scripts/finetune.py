@@ -1085,8 +1085,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
 
-            # [If applicable] Linearly warm up learning rate from 10% to 100% of original
-            if cfg.lr_warmup_steps > 0:
+            # [If applicable] Linearly warm up learning rate from 10% to 100% of original.
+            # Important: do not keep overriding LR after warmup, otherwise scheduler decay is canceled.
+            if cfg.lr_warmup_steps > 0 and (gradient_step_idx + 1) <= cfg.lr_warmup_steps:
                 lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
                 current_lr = original_lr * (0.1 + 0.9 * lr_progress)
                 for param_group in optimizer.param_groups:
