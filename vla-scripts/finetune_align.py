@@ -3720,8 +3720,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             gradient_step_idx = (batch_idx + 1) // cfg.grad_accumulation_steps
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
 
-            # [If applicable] Linearly warm up learning rate from 10% to 100% of original
-            if cfg.lr_warmup_steps > 0:
+            # [If applicable] Linearly warm up learning rate from 10% to 100% of original.
+            # Important: do not keep overriding LR after warmup, otherwise scheduler decay is canceled.
+            if cfg.lr_warmup_steps > 0 and gradient_step_idx <= cfg.lr_warmup_steps:
                 lr_progress = min(gradient_step_idx / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
                 current_lr = original_lr * (0.1 + 0.9 * lr_progress)
                 for param_group in optimizer.param_groups:
