@@ -237,10 +237,12 @@ class KnowledgeRouter(nn.Module):
     Task-conditioned token router for visual/3D tokens before feeding into the LLM.
 
     Architecture:
-      1) Cross-attention with text tokens as Query and candidate visual tokens as Key/Value.
-      2) Token-wise MLP gate (Linear-GELU-Linear) producing keep probabilities.
+      1) Project candidate visual tokens into text embedding space.
+      2) Cross-attention with visual tokens as Query and contextualized text tokens as Key/Value to produce
+         text-conditioned visual token embeddings.
+      3) Token-wise MLP gate (Linear-GELU-Linear) producing keep probabilities.
 
-    During training, online pseudo-labels are built from detached text->token attention
+    During training, online pseudo-labels are built from detached visual->text attention
     scores (top-k by keep ratio), and focal BCE is used for supervision.
     """
 
@@ -272,7 +274,10 @@ class KnowledgeRouter(nn.Module):
 
         # Project candidate tokens into language-token space before cross-attention.
         self.token_proj = nn.Linear(token_dim, text_dim, bias=True)
+        # Kept for checkpoint compatibility with earlier router versions.
         self.query_proj = nn.Linear(text_dim, text_dim, bias=True)
+        for param in self.query_proj.parameters():
+            param.requires_grad = False
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=text_dim,
             num_heads=num_heads,
@@ -402,24 +407,26 @@ class KnowledgeRouter(nn.Module):
                 f"candidate_tokens={tuple(candidate_tokens.shape)}."
             )
 
-        query_tokens = self.query_proj(text_tokens).to(dtype=candidate_tokens.dtype)
+        # Use contextualized language embeddings directly as cross-attention K/V.
+        # (No text projection in forward.)
+        projected_text_tokens = text_tokens.to(dtype=candidate_tokens.dtype)
         projected_candidate_tokens = self.token_proj(candidate_tokens).to(dtype=candidate_tokens.dtype)
 
         # Text tokens are already contextualized by the LLM stack; keep their representation unchanged here.
         projected_candidate_tokens = self._apply_rope(projected_candidate_tokens, candidate_positions)
 
         attn_output, attn_weights = self.cross_attn(
-            query=query_tokens,
-            key=projected_candidate_tokens,
-            value=projected_candidate_tokens,
+            query=projected_candidate_tokens,
+            key=projected_text_tokens,
+            value=projected_text_tokens,
+            key_padding_mask=~text_mask.bool(),
             need_weights=True,
             average_attn_weights=True,
         )
-        # context: (B, D)
-        text_context = self._masked_mean(attn_output, text_mask)
-        token_context = text_context.unsqueeze(1).expand(-1, projected_candidate_tokens.shape[1], -1)
 
-        gate_logits = self.fc2(self.act_fn(self.fc1(projected_candidate_tokens + token_context))).squeeze(-1).float()
+        # Per-visual-token text-conditioned features from cross-attention.
+        gate_input = projected_candidate_tokens + attn_output
+        gate_logits = self.fc2(self.act_fn(self.fc1(gate_input))).squeeze(-1).float()
         gate_logits = torch.nan_to_num(gate_logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         gate_probs = torch.sigmoid(gate_logits / max(float(self.temperature), 1e-6))
 
@@ -443,8 +450,11 @@ class KnowledgeRouter(nn.Module):
         selected_candidate_tokens = torch.gather(candidate_tokens, dim=1, index=selected_idx_expanded)
         pruned_gated_tokens = selected_candidate_tokens * selected_gate_probs.to(selected_candidate_tokens.dtype).unsqueeze(-1)
 
-        # Build online pseudo labels from detached attention scores.
-        token_scores = self._masked_mean(attn_weights.float(), text_mask).detach()
+        # Build online pseudo labels from detached visual->text attention scores.
+        # attn_weights: (B, N_visual, T_text) when average_attn_weights=True.
+        text_mask_float = text_mask.to(dtype=attn_weights.dtype).unsqueeze(1)
+        text_mask_denom = text_mask_float.sum(dim=2).clamp_min(1.0)
+        token_scores = ((attn_weights.float() * text_mask_float).sum(dim=2) / text_mask_denom).detach()
         token_scores = torch.nan_to_num(token_scores, nan=-1e4, posinf=1e4, neginf=-1e4)
         pseudo_targets = self._build_online_pseudo_targets(
             token_scores=token_scores,
