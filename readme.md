@@ -1,4 +1,4 @@
-# SPARK (Spatial Representation Distillation and Knowledge Routing)
+# SPARK-VLA (Spatial Representation Distillation and Knowledge Routing for Vision-Language-Action Models)
 
 This repository contains SPARK modified from Spatial-Forcing code used for LIBERO experiments, including:
 - attention-response alignment (VLA \u2194 VGGT),
